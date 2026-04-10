@@ -16,11 +16,13 @@ pub const SessionEntry = struct {
     created_at: u64,
     task_ended_at: ?u64,
     task_exit_code: ?u8,
+    vars: ?[]const u8 = null,
 
     pub fn deinit(self: SessionEntry, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
         if (self.cmd) |cmd| alloc.free(cmd);
         if (self.cwd) |cwd| alloc.free(cwd);
+        if (self.vars) |vars| alloc.free(vars);
     }
 
     pub fn lessThan(_: void, a: SessionEntry, b: SessionEntry) bool {
@@ -84,6 +86,8 @@ pub fn get_session_entries(
             else
                 null;
 
+            const vars = socket.readVarsFile(alloc, dir, entry.name);
+
             try sessions.append(alloc, .{
                 .name = name,
                 .pid = result.info.pid,
@@ -95,6 +99,7 @@ pub fn get_session_entries(
                 .created_at = result.info.created_at,
                 .task_ended_at = result.info.task_ended_at,
                 .task_exit_code = result.info.task_exit_code,
+                .vars = vars,
             });
         }
     }
@@ -548,6 +553,13 @@ pub fn writeSessionLine(
     }
     if (session.cmd) |cmd| {
         try writer.print("\tcmd={s}", .{cmd});
+    }
+    if (session.vars) |vars| {
+        var lines = std.mem.splitScalar(u8, vars, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            try writer.print("\t{s}", .{line});
+        }
     }
     if (session.task_ended_at) |ended_at| {
         if (ended_at > 0) {

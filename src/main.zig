@@ -59,7 +59,7 @@ pub fn main() !void {
     defer log_system.deinit();
 
     const cmd = args.next() orelse {
-        return list(&cfg, false);
+        return list(&cfg, false, null);
     };
 
     if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "v") or std.mem.eql(u8, cmd, "-v") or std.mem.eql(u8, cmd, "--version")) {
@@ -67,8 +67,16 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "h") or std.mem.eql(u8, cmd, "-h")) {
         return help();
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l")) {
-        const short = if (args.next()) |arg| std.mem.eql(u8, arg, "--short") else false;
-        return list(&cfg, short);
+        var short = false;
+        var filter_name: ?[]const u8 = null;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--short")) {
+                short = true;
+            } else if (filter_name == null) {
+                filter_name = arg;
+            }
+        }
+        return list(&cfg, short, filter_name);
     } else if (std.mem.eql(u8, cmd, "completions") or std.mem.eql(u8, cmd, "c")) {
         const arg = args.next() orelse return;
         const shell = completions.Shell.fromString(arg) orelse return;
@@ -96,7 +104,15 @@ pub fn main() !void {
 
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(alloc);
+        var session_vars: std.ArrayList([2][]const u8) = .empty;
+        defer session_vars.deinit(alloc);
         while (args.next()) |arg| {
+            if (std.mem.indexOfScalar(u8, arg, '=')) |eq_pos| {
+                if (eq_pos > 0 and command_args.items.len == 0) {
+                    try session_vars.append(alloc, .{ arg[0..eq_pos], arg[eq_pos + 1 ..] });
+                    continue;
+                }
+            }
             try command_args.append(alloc, arg);
         }
 
@@ -123,6 +139,7 @@ pub fn main() !void {
             .cwd = cwd,
             .created_at = @intCast(std.time.timestamp()),
             .leader_client_fd = null,
+            .session_vars = session_vars.items,
         };
         daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
             error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
@@ -135,7 +152,15 @@ pub fn main() !void {
 
         var cmd_args_raw: std.ArrayList([]const u8) = .empty;
         defer cmd_args_raw.deinit(alloc);
+        var session_vars: std.ArrayList([2][]const u8) = .empty;
+        defer session_vars.deinit(alloc);
         while (args.next()) |arg| {
+            if (std.mem.indexOfScalar(u8, arg, '=')) |eq_pos| {
+                if (eq_pos > 0 and cmd_args_raw.items.len == 0) {
+                    try session_vars.append(alloc, .{ arg[0..eq_pos], arg[eq_pos + 1 ..] });
+                    continue;
+                }
+            }
             try cmd_args_raw.append(alloc, arg);
         }
         const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
@@ -159,6 +184,7 @@ pub fn main() !void {
             .is_task_mode = true,
             .task_command = cmd_args_raw.items,
             .leader_client_fd = undefined,
+            .session_vars = session_vars.items,
         };
         daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
             error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
@@ -241,6 +267,24 @@ pub fn main() !void {
             try args_raw.append(alloc, prefix);
         }
         return wait(&cfg, args_raw);
+    } else if (std.mem.eql(u8, cmd, "vars") or std.mem.eql(u8, cmd, "va")) {
+        const session_name = args.next() orelse return error.SessionNameRequired;
+        var session_vars: std.ArrayList([2][]const u8) = .empty;
+        defer session_vars.deinit(alloc);
+        while (args.next()) |arg| {
+            if (std.mem.indexOfScalar(u8, arg, '=')) |eq_pos| {
+                if (eq_pos > 0) {
+                    try session_vars.append(alloc, .{ arg[0..eq_pos], arg[eq_pos + 1 ..] });
+                }
+            }
+        }
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+        if (session_vars.items.len > 0) {
+            var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+            defer dir.close();
+            try socket.mergeVarsFile(alloc, dir, sesh, session_vars.items);
+        }
     } else {
         return help();
     }
@@ -348,6 +392,7 @@ const Daemon = struct {
     task_ended_at: ?u64 = null, // timestamp when task exited
     task_command: ?[]const []const u8 = null,
     pty_write_buf: std.ArrayList(u8) = .empty,
+    session_vars: []const [2][]const u8 = &.{},
 
     const EnsureSessionResult = struct {
         created: bool,
@@ -513,6 +558,12 @@ const Daemon = struct {
             }
         }
 
+        if (self.session_vars.len > 0) {
+            socket.mergeVarsFile(self.alloc, dir, self.session_name, self.session_vars) catch |err| {
+                std.log.warn("failed to merge vars file err={s}", .{@errorName(err)});
+            };
+        }
+
         if (should_create) {
             std.log.info("creating session={s}", .{self.session_name});
             const server_sock_fd = try socket.createSocket(self.socket_path);
@@ -543,6 +594,7 @@ const Daemon = struct {
                 const pty_fd = self.spawnPty() catch |err| {
                     posix.close(server_sock_fd);
                     dir.deleteFile(self.session_name) catch {};
+                    socket.deleteVarsFile(dir, self.session_name);
                     return err;
                 };
 
@@ -556,6 +608,7 @@ const Daemon = struct {
                     dir.deleteFile(self.session_name) catch |err| {
                         std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
                     };
+                    socket.deleteVarsFile(dir, self.session_name);
                 }
 
                 try daemonLoop(self, server_sock_fd, pty_fd);
@@ -873,16 +926,31 @@ fn help() !void {
         \\Usage: zmx <command> [args]
         \\
         \\Commands:
-        \\  [a]ttach <name> [command...]   Attach to session, creating session if needed
-        \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
+        \\  [a]ttach <name> [key=val...] [command...]
+        \\                                 Attach to session, creating session if needed
+        \\  [r]un <name> [key=val...] [command...]
+        \\                                 Send command without attaching, creating session if needed
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
-        \\  [l]ist [--short]               List active sessions
+        \\  [l]ist [name] [--short]        List active sessions (includes vars if set)
         \\  [k]ill <name>... [--force]     Kill a session and all attached clients
         \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
+        \\  [va]rs <name> [key=val...]     Get or set session vars
         \\  [w]ait <name>...               Wait for session tasks to complete
         \\  [c]ompletions <shell>          Completion scripts for shell integration (bash, zsh, or fish)
         \\  [v]ersion                      Show version information
         \\  [h]elp                         Show this help message
+        \\
+        \\Session vars:
+        \\  Sessions can carry key=value metadata (vars) that are stored alongside the
+        \\  session socket as <name>.vars. Vars are set by passing key=value pairs before
+        \\  any command arguments to attach or run:
+        \\
+        \\    zmx attach mysession env=prod region=us-east-1
+        \\    zmx attach mysession env=staging       # update a var on re-attach
+        \\    zmx attach mysession env=              # delete a var (empty value)
+        \\
+        \\  Vars persist for the lifetime of the session and are shown by `zmx list`.
+        \\  They are cleaned up automatically when the session exits or is killed.
         \\
         \\Environment variables:
         \\  - SHELL                Determines which shell is used when creating a session
@@ -1012,7 +1080,7 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
     }
 }
 
-fn list(cfg: *Cfg, short: bool) !void {
+fn list(cfg: *Cfg, short: bool, filter_name: ?[]const u8) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -1041,6 +1109,9 @@ fn list(cfg: *Cfg, short: bool) !void {
     std.mem.sort(util.SessionEntry, sessions.items, {}, util.SessionEntry.lessThan);
 
     for (sessions.items) |session| {
+        if (filter_name) |name| {
+            if (!std.mem.eql(u8, session.name, name)) continue;
+        }
         try util.writeSessionLine(&stdout.interface, session, short, current_session);
         try stdout.interface.flush();
     }

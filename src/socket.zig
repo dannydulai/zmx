@@ -41,6 +41,126 @@ pub fn cleanupStaleSocket(dir: std.fs.Dir, session_name: []const u8) void {
     dir.deleteFile(session_name) catch |err| {
         std.log.warn("failed to delete stale socket err={s}", .{@errorName(err)});
     };
+    deleteVarsFile(dir, session_name);
+}
+
+/// Merge new vars into the existing vars file for a session.
+/// Reads current vars, applies changes (empty value = delete), writes back.
+/// Deletes the file if no vars remain.
+pub fn mergeVarsFile(
+    alloc: std.mem.Allocator,
+    dir: std.fs.Dir,
+    session_name: []const u8,
+    new_vars: []const [2][]const u8,
+) !void {
+    var name_buf: [1024]u8 = undefined;
+    const fname = varsFileName(&name_buf, session_name) orelse return error.NameTooLong;
+
+    // Read existing vars
+    var keys: std.ArrayList([]const u8) = .empty;
+    var values: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| alloc.free(k);
+        keys.deinit(alloc);
+        for (values.items) |v| alloc.free(v);
+        values.deinit(alloc);
+    }
+
+    if (dir.openFile(fname, .{})) |file| {
+        defer file.close();
+        const content = try file.readToEndAlloc(alloc, 64 * 1024);
+        defer alloc.free(content);
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            if (std.mem.indexOfScalar(u8, line, '=')) |eq| {
+                if (eq == 0) continue;
+                try keys.append(alloc, try alloc.dupe(u8, line[0..eq]));
+                try values.append(alloc, try alloc.dupe(u8, line[eq + 1 ..]));
+            }
+        }
+    } else |_| {}
+
+    // Apply new vars
+    for (new_vars) |kv| {
+        const key = kv[0];
+        const value = kv[1];
+
+        // Find existing key
+        var found: ?usize = null;
+        for (keys.items, 0..) |k, i| {
+            if (std.mem.eql(u8, k, key)) {
+                found = i;
+                break;
+            }
+        }
+
+        if (value.len == 0) {
+            // Delete
+            if (found) |i| {
+                alloc.free(keys.items[i]);
+                alloc.free(values.items[i]);
+                _ = keys.orderedRemove(i);
+                _ = values.orderedRemove(i);
+            }
+        } else if (found) |i| {
+            // Update
+            alloc.free(values.items[i]);
+            values.items[i] = try alloc.dupe(u8, value);
+        } else {
+            // Add
+            try keys.append(alloc, try alloc.dupe(u8, key));
+            try values.append(alloc, try alloc.dupe(u8, value));
+        }
+    }
+
+    if (keys.items.len == 0) {
+        dir.deleteFile(fname) catch {};
+        return;
+    }
+
+    const file = try dir.createFile(fname, .{});
+    defer file.close();
+    var write_buf: [4096]u8 = undefined;
+    var w = file.writer(&write_buf);
+    for (keys.items, values.items) |k, v| {
+        try w.interface.print("{s}={s}\n", .{ k, v });
+    }
+    try w.interface.flush();
+}
+
+pub fn deleteVarsFile(dir: std.fs.Dir, session_name: []const u8) void {
+    var buf: [1024]u8 = undefined;
+    const name = varsFileName(&buf, session_name) orelse return;
+    dir.deleteFile(name) catch {};
+}
+
+/// Read the vars file contents, returning null if it doesn't exist or on error.
+pub fn readVarsFile(alloc: std.mem.Allocator, dir: std.fs.Dir, session_name: []const u8) ?[]const u8 {
+    var buf: [1024]u8 = undefined;
+    const name = varsFileName(&buf, session_name) orelse return null;
+    const file = dir.openFile(name, .{}) catch return null;
+    defer file.close();
+    const content = file.readToEndAlloc(alloc, 64 * 1024) catch return null;
+    // Trim trailing newline for display
+    const trimmed = std.mem.trimRight(u8, content, "\n");
+    if (trimmed.len == content.len) return content;
+    // Shrink allocation
+    const result = alloc.dupe(u8, trimmed) catch {
+        alloc.free(content);
+        return null;
+    };
+    alloc.free(content);
+    return result;
+}
+
+fn varsFileName(buf: *[1024]u8, session_name: []const u8) ?[]const u8 {
+    const suffix = ".vars";
+    if (session_name.len + suffix.len > buf.len) return null;
+    @memcpy(buf[0..session_name.len], session_name);
+    @memcpy(buf[session_name.len .. session_name.len + suffix.len], suffix);
+    return buf[0 .. session_name.len + suffix.len];
 }
 
 pub fn sessionExists(dir: std.fs.Dir, name: []const u8) !bool {
